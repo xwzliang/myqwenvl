@@ -11,13 +11,61 @@ import tempfile
 from moviepy import VideoFileClip
 import traceback
 import logging
+from datetime import datetime
+import shutil
 
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Create logs directory if it doesn't exist
+log_dir = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, "server.log")
+
+def write_log(message, level="INFO"):
+    """Write log message directly to file and console."""
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = f"{timestamp} - {level} - {message}\n"
+        
+        # Write to console
+        print(log_message, end='')
+        
+        # Write to log file
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(log_message)
+    except Exception as e:
+        print(f"Error writing to log: {str(e)}")
+
+def rotate_log_file(log_file, max_size_mb=10):
+    """Rotate log file if it exceeds the maximum size.
+    
+    Args:
+        log_file (str): Path to the log file
+        max_size_mb (int): Maximum size in MB before rotation
+    """
+    try:
+        if not os.path.exists(log_file):
+            return
+
+        # Get file size in MB
+        file_size_mb = os.path.getsize(log_file) / (1024 * 1024)
+        
+        if file_size_mb > max_size_mb:
+            # Create backup filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_file = f"{log_file}.{timestamp}"
+            
+            # Copy current log file to backup
+            shutil.copy2(log_file, backup_file)
+            
+            # Empty the current log file
+            with open(log_file, 'w') as f:
+                f.write(f"=== Log rotated at {datetime.now()} ===\n")
+            
+            write_log(f"Log file rotated. Backup created at: {backup_file}")
+    except Exception as e:
+        write_log(f"Error rotating log file: {str(e)}", "ERROR")
+
+# Rotate log file if it exists
+rotate_log_file(log_file)
 
 app = FastAPI()
 
@@ -39,6 +87,7 @@ def load_models():
     """Load the model and processor."""
     global model, processor
     if model is None:
+        write_log("Loading model...")
         # We recommend enabling flash_attention_2 for better acceleration and memory saving
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             MODEL_PATH,
@@ -47,23 +96,29 @@ def load_models():
             device_map="auto",
             load_in_4bit=True,
         )
+        write_log("Model loaded successfully")
     if processor is None:
+        write_log("Loading processor...")
         processor = AutoProcessor.from_pretrained(MODEL_PATH)
+        write_log("Processor loaded successfully")
 
 def unload_models():
     """Unload the model and processor to free memory."""
     global model, processor
     try:
         if model is not None:
+            write_log("Moving model to CPU...")
             # Move model to CPU first to ensure all GPU tensors are freed
             model = model.cpu()
             # Delete model and clear CUDA cache
             del model
             model = None
+            write_log("Model unloaded successfully")
             
         if processor is not None:
             del processor
             processor = None
+            write_log("Processor unloaded successfully")
             
         if torch.cuda.is_available():
             # Reset CUDA memory stats
@@ -82,10 +137,11 @@ def unload_models():
             # Get current memory stats
             allocated = torch.cuda.memory_allocated() / 1024**3  # Convert to GB
             reserved = torch.cuda.memory_reserved() / 1024**3    # Convert to GB
-            print(f"After cleanup - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+            write_log(f"After cleanup - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
             
     except Exception as e:
-        print(f"Error during model unloading: {str(e)}")
+        error_msg = f"Error during model unloading: {str(e)}"
+        write_log(error_msg, "ERROR")
         raise e
 
 @app.post("/load_model")
@@ -95,7 +151,9 @@ async def load_model():
         load_models()
         return {"status": "success", "message": "Model loaded successfully"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = f"Error loading model: {str(e)}"
+        write_log(error_msg, "ERROR")
+        raise HTTPException(status_code=500, detail=error_msg)
 
 @app.post("/unload_model")
 async def unload_model():
@@ -104,7 +162,9 @@ async def unload_model():
         unload_models()
         return {"status": "success", "message": "Model unloaded successfully"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = f"Error unloading model: {str(e)}"
+        write_log(error_msg, "ERROR")
+        raise HTTPException(status_code=500, detail=error_msg)
 
 @app.get("/model_info")
 async def get_model_info():
@@ -129,7 +189,9 @@ async def get_model_info():
             }
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = f"Error getting model info: {str(e)}"
+        write_log(error_msg, "ERROR")
+        raise HTTPException(status_code=500, detail=error_msg)
 
 def create_temp_video_clip(video_path: str, start_time: Optional[float], end_time: Optional[float]) -> str:
     """Create a temporary video clip from the original video using the specified timestamps."""
@@ -144,29 +206,29 @@ def create_temp_video_clip(video_path: str, start_time: Optional[float], end_tim
         temp_path = temp_file.name
         temp_file.close()
 
-        logger.debug(f"Creating temporary video clip from {video_path}")
-        logger.debug(f"Start time: {start_time}, End time: {end_time}")
+        write_log(f"Creating temporary video clip from {video_path}")
+        write_log(f"Start time: {start_time}, End time: {end_time}")
 
         # Load the video
         video = VideoFileClip(video_path)
-        logger.debug(f"Original video duration: {video.duration}")
+        write_log(f"Original video duration: {video.duration}")
         
         # If timestamps are provided, create a subclip
         if start_time is not None or end_time is not None:
             start = start_time if start_time is not None else 0
             end = end_time if end_time is not None else video.duration
-            logger.debug(f"Creating subclip from {start} to {end}")
+            write_log(f"Creating subclip from {start} to {end}")
             video = video.subclipped(start, end)
         
         # Write the video to the temporary file
-        logger.debug(f"Writing video to temporary file: {temp_path}")
+        write_log(f"Writing video to temporary file: {temp_path}")
         video.write_videofile(temp_path, codec='libx264', audio_codec='aac')
         video.close()
         
         return temp_path
     except Exception as e:
         error_msg = f"Error creating video clip: {str(e)}\n{traceback.format_exc()}"
-        logger.error(error_msg)
+        write_log(error_msg, "ERROR")
         raise HTTPException(status_code=500, detail=error_msg)
 
 def cleanup_temp_video(temp_path: str):
@@ -174,24 +236,24 @@ def cleanup_temp_video(temp_path: str):
     try:
         if os.path.exists(temp_path):
             os.unlink(temp_path)
-            logger.debug(f"Cleaned up temporary file: {temp_path}")
+            write_log(f"Cleaned up temporary file: {temp_path}")
     except Exception as e:
-        logger.warning(f"Error cleaning up temporary file {temp_path}: {str(e)}")
+        write_log(f"Error cleaning up temporary file {temp_path}: {str(e)}", "WARNING")
 
 @app.post("/generate_caption")
 async def generate_caption(request: CaptionRequest):
     temp_video_path = None
     try:
-        logger.debug(f"Received caption request for video: {request.video_path}")
-        logger.debug(f"Request parameters: {request.dict()}")
+        write_log(f"Received caption request for video: {request.video_path}")
+        write_log(f"Request parameters: {request.dict()}")
 
         if model is None or processor is None:
             error_msg = "Model not loaded. Please load the model first."
-            logger.error(error_msg)
+            write_log(error_msg, "ERROR")
             raise HTTPException(status_code=400, detail=error_msg)
             
         video_path = request.video_path.replace("/home/broliang", "/data/shared/Qwen")
-        logger.debug(f"Processed video path: {video_path}")
+        write_log(f"Processed video path: {video_path}")
 
         # Create temporary video clip if timestamps are provided
         if request.start_time is not None or request.end_time is not None:
@@ -201,10 +263,10 @@ async def generate_caption(request: CaptionRequest):
                 request.end_time
             )
             video_path_to_use = temp_video_path
-            logger.debug(f"Using temporary video clip: {temp_video_path}")
+            write_log(f"Using temporary video clip: {temp_video_path}")
         else:
             video_path_to_use = video_path
-            logger.debug("Using original video path")
+            write_log("Using original video path")
 
         # Prepare the message with video information
         messages = [
@@ -226,7 +288,7 @@ async def generate_caption(request: CaptionRequest):
         if request.transcript:
             messages[0]["content"][1]["text"] = f"Given the transcript: '{request.transcript}', {request.query}"
         
-        logger.debug(f"Prepared messages for model: {messages}")
+        write_log(f"Prepared messages for model: {messages}")
 
         # Process the input
         text = processor.apply_chat_template(
@@ -244,7 +306,7 @@ async def generate_caption(request: CaptionRequest):
         inputs = inputs.to("cuda", dtype=torch.float16)
 
         # Generate caption
-        logger.debug("Generating caption...")
+        write_log("Generating caption...")
         generated_ids = model.generate(**inputs, max_new_tokens=1024)
         generated_ids_trimmed = [
             out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
@@ -253,12 +315,12 @@ async def generate_caption(request: CaptionRequest):
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
         
-        logger.debug(f"Generated caption: {output_text}")
+        write_log(f"Generated caption: {output_text}")
         return {"caption": output_text}
 
     except Exception as e:
         error_msg = f"Error generating caption: {str(e)}\n{traceback.format_exc()}"
-        logger.error(error_msg)
+        write_log(error_msg, "ERROR")
         raise HTTPException(status_code=500, detail=error_msg)
     finally:
         # Clean up temporary video file if it was created
@@ -266,4 +328,5 @@ async def generate_caption(request: CaptionRequest):
             cleanup_temp_video(temp_video_path)
 
 if __name__ == "__main__":
+    write_log("Starting Qwen VL server...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
