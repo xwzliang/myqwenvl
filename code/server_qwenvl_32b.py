@@ -12,11 +12,13 @@ import uvicorn
 import gc
 import os
 import tempfile
+import re
 from moviepy import VideoFileClip
 import traceback
 import logging
 from datetime import datetime
 import shutil
+import threading
 
 # Create logs directory if it doesn't exist
 log_dir = os.path.join(os.path.dirname(__file__), "logs")
@@ -183,6 +185,19 @@ async def unload_model():
         raise HTTPException(status_code=500, detail=error_msg)
 
 
+@app.post("/self-shutdown")
+async def self_shutdown():
+    def exit_later():
+        # short delay to ensure response is sent
+        import time
+
+        time.sleep(0.1)
+        os._exit(0)  # immediate hard exit
+
+    threading.Thread(target=exit_later, daemon=True).start()
+    return {"status": "shutting down"}
+
+
 @app.get("/model_info")
 async def get_model_info():
     """Get information about the loaded model."""
@@ -284,6 +299,12 @@ async def generate_caption(request: CaptionRequest):
             raise HTTPException(status_code=400, detail=error_msg)
 
         video_path = request.video_path.replace("/home/broliang", "/data/shared/Qwen")
+        video_path = request.video_path.replace("~/", "/data/shared/Qwen/")
+        video_path = re.sub(
+            r"^/data/video_summarizer(?=/|$)(.*)",
+            r"/data/shared/Qwen/videos/video_summarizer\1",
+            video_path,
+        )
         write_log(f"Processed video path: {video_path}")
 
         # Create temporary video clip if timestamps are provided
@@ -340,7 +361,7 @@ async def generate_caption(request: CaptionRequest):
 
         # Generate caption
         write_log("Generating caption...")
-        generated_ids = model.generate(**inputs, max_new_tokens=2048)
+        generated_ids = model.generate(**inputs, max_new_tokens=8192)
         generated_ids_trimmed = [
             out_ids[len(in_ids) :]
             for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
