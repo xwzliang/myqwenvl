@@ -286,7 +286,7 @@ def cleanup_temp_video(temp_path: str):
         write_log(f"Error cleaning up temporary file {temp_path}: {str(e)}", "WARNING")
 
 
-@app.post("/generate_caption")
+@app.post("/infer_path")
 async def generate_caption(request: CaptionRequest):
     temp_video_path = None
     try:
