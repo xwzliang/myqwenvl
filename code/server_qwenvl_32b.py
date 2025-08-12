@@ -81,17 +81,8 @@ app = FastAPI()
 # Global variables for model and processor
 model = None
 processor = None
-MODEL_PATH = "./models/Qwen2.5-VL-32B-Instruct"
-
-
-class CaptionRequest(BaseModel):
-    video_path: str
-    start_time: Optional[float] = None
-    end_time: Optional[float] = None
-    transcript: Optional[str] = None
-    query: str
-    fps: float = 5.0
-    max_pixels: int = 360 * 420
+# MODEL_PATH = "./models/Qwen2.5-VL-32B-Instruct"
+MODEL_PATH = "./models/Qwen2.5-VL-7B-Instruct"
 
 
 def load_models():
@@ -286,6 +277,16 @@ def cleanup_temp_video(temp_path: str):
         write_log(f"Error cleaning up temporary file {temp_path}: {str(e)}", "WARNING")
 
 
+class CaptionRequest(BaseModel):
+    video_path: str
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
+    transcript: Optional[str] = None
+    query: str
+    fps: float = 5.0
+    max_pixels: int = 360 * 420
+
+
 @app.post("/infer_path")
 async def generate_caption(request: CaptionRequest):
     temp_video_path = None
@@ -294,9 +295,7 @@ async def generate_caption(request: CaptionRequest):
         write_log(f"Request parameters: {request.dict()}")
 
         if model is None or processor is None:
-            error_msg = "Model not loaded. Please load the model first."
-            write_log(error_msg, "ERROR")
-            raise HTTPException(status_code=400, detail=error_msg)
+            load_models()
 
         video_path = request.video_path.replace("/home/broliang", "/data/shared/Qwen")
         video_path = request.video_path.replace("~/", "/data/shared/Qwen/")
@@ -411,9 +410,7 @@ async def infer(
         write_log(f"Saved to temporary path: {uploaded_video_path}")
 
         if model is None or processor is None:
-            error_msg = "Model not loaded. Please load the model first."
-            write_log(error_msg, "ERROR")
-            raise HTTPException(status_code=400, detail=error_msg)
+            load_models()
 
         # Handle clipping
         if start_time is not None or end_time is not None:
@@ -491,6 +488,234 @@ async def infer(
             cleanup_temp_video(temp_video_path)
         if uploaded_video_path and os.path.exists(uploaded_video_path):
             os.remove(uploaded_video_path)
+
+
+class ImagesRequest(BaseModel):
+    image_paths: List[str]
+    query: str
+    transcript: Optional[str] = None
+    max_new_tokens: int = 8192  # optional override
+
+
+@app.post("/infer_images_path")
+async def generate_caption_from_images(request: ImagesRequest):
+    try:
+        write_log(f"Received images request: {len(request.image_paths)} images")
+        write_log(f"Request parameters: {request.dict()}")
+
+        if model is None or processor is None:
+            load_models()
+
+        if not request.image_paths:
+            raise HTTPException(status_code=400, detail="image_paths cannot be empty.")
+
+        def strip_file_uri(p: str) -> str:
+            return p[7:] if p.startswith("file://") else p
+
+        def normalize_path(p: str) -> str:
+            # replicate your video path rewrites for images
+            p = strip_file_uri(p)
+            p = p.replace("/home/broliang", "/data/shared/Qwen")
+            p = p.replace("~/", "/data/shared/Qwen/")
+            p = re.sub(
+                r"^/data/video_summarizer(?=/|$)(.*)",
+                r"/data/shared/Qwen/videos/video_summarizer\1",
+                p,
+            )
+            return p
+
+        def to_file_uri(p: str) -> str:
+            # ensure "file://..." for local absolute paths
+            return p if p.startswith("file://") else f"file://{p}"
+
+        # Normalize and validate all image paths
+        normalized_file_uris: List[str] = []
+        for raw in request.image_paths:
+            np = normalize_path(raw)
+            if not os.path.exists(np):
+                msg = f"Image not found: {np}"
+                write_log(msg, "ERROR")
+                raise HTTPException(status_code=400, detail=msg)
+            normalized_file_uris.append(to_file_uri(np))
+
+        write_log(f"Processed image URIs: {normalized_file_uris}")
+
+        # Build messages (multiple images + text query)
+        user_text = request.query
+        if request.transcript:
+            user_text = f"Given the transcript: '{request.transcript}', {request.query}"
+
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    [{"type": "image", "image": uri} for uri in normalized_file_uris]
+                    + [{"type": "text", "text": user_text}]
+                ),
+            }
+        ]
+
+        write_log(f"Prepared messages for model: {messages}")
+
+        # Prepare inputs
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = inputs.to("cuda", dtype=torch.float16)
+
+        # Inference
+        write_log("Generating caption for images...")
+        generated_ids = model.generate(**inputs, max_new_tokens=request.max_new_tokens)
+        generated_ids_trimmed = [
+            out_ids[len(in_ids) :]
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        output_text = processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0]
+
+        write_log(f"Generated caption: {output_text}")
+        return {"caption": output_text}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = (
+            f"Error generating caption from images: {str(e)}\n{traceback.format_exc()}"
+        )
+        write_log(error_msg, "ERROR")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+class BatchImagesRequest(BaseModel):
+    image_paths: List[str]
+    query: str
+    transcript: Optional[str] = None
+    max_new_tokens: int = 8192  # optional override
+
+
+@app.post("/infer_batch_images_path")
+async def infer_batch_images_path(request: BatchImagesRequest):
+    try:
+        write_log(f"Received batch images request: {len(request.image_paths)} images")
+        write_log(f"Request parameters: {request.dict()}")
+
+        if model is None or processor is None:
+            load_models()
+
+        if not request.image_paths:
+            raise HTTPException(status_code=400, detail="image_paths cannot be empty.")
+
+        def strip_file_uri(p: str) -> str:
+            return p[7:] if p.startswith("file://") else p
+
+        def normalize_path(p: str) -> str:
+            p = strip_file_uri(p)
+            p = p.replace("/home/broliang", "/data/shared/Qwen")
+            p = p.replace("~/", "/data/shared/Qwen/")
+            p = re.sub(
+                r"^/data/video_summarizer(?=/|$)(.*)",
+                r"/data/shared/Qwen/videos/video_summarizer\1",
+                p,
+            )
+            return p
+
+        def to_file_uri(p: str) -> str:
+            return p if p.startswith("file://") else f"file://{p}"
+
+        # Normalize and validate all image paths
+        normalized_paths = []
+        file_uris = []
+        for raw in request.image_paths:
+            np = normalize_path(raw)
+            if not os.path.exists(np):
+                msg = f"Image not found: {np}"
+                write_log(msg, "ERROR")
+                raise HTTPException(status_code=400, detail=msg)
+            normalized_paths.append(np)
+            file_uris.append(to_file_uri(np))
+
+        write_log(f"Processed image URIs for batch: {file_uris}")
+
+        # Common user text (optionally include transcript context)
+        user_text = request.query
+        if request.transcript:
+            user_text = f"Given the transcript: '{request.transcript}', {request.query}"
+
+        # Build one conversation per image
+        conversations = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": uri},
+                        {"type": "text", "text": user_text},
+                    ],
+                }
+            ]
+            for uri in file_uris
+        ]
+
+        write_log(f"Prepared {len(conversations)} conversations for batch inference")
+
+        # Prepare batched inputs
+        texts = [
+            processor.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True
+            )
+            for msgs in conversations
+        ]
+        image_inputs, video_inputs = process_vision_info(conversations)
+        inputs = processor(
+            text=texts,
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = inputs.to("cuda", dtype=torch.float16)
+
+        # Batch inference
+        write_log("Running batch generation for images...")
+        generated_ids = model.generate(**inputs, max_new_tokens=request.max_new_tokens)
+        generated_ids_trimmed = [
+            out_ids[len(in_ids) :]
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        output_texts = processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+        # Package results (path + caption)
+        results = []
+        for file_uri, caption in zip(file_uris, output_texts):
+            results.append({"image": file_uri, "caption": caption})
+            write_log(file_uri)
+            write_log(caption)
+
+        write_log(f"Batch generated {len(results)} captions")
+        return {"caption": results}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = (
+            f"Error in batch image inference: {str(e)}\n{traceback.format_exc()}"
+        )
+        write_log(error_msg, "ERROR")
+        raise HTTPException(status_code=500, detail=error_msg)
 
 
 if __name__ == "__main__":
