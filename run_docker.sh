@@ -1,0 +1,1 @@
+docker run --gpus all -v ~/models/qwenvl:/data/shared/Qwen/models -v /mnt/omv/resources:/data/shared/Qwen/videos -p 8000:8000 --network mynet --name qwenvl --restart always --entrypoint bash -itd my_qwenvl -c "python models/code/server_qwenvl_32b.py"

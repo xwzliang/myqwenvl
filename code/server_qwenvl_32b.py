@@ -300,7 +300,7 @@ async def generate_caption(request: CaptionRequest):
         video_path = request.video_path.replace("/home/broliang", "/data/shared/Qwen")
         video_path = request.video_path.replace("~/", "/data/shared/Qwen/")
         video_path = re.sub(
-            r"^/data/video_summarizer(?=/|$)(.*)",
+            r"^/mnt/omv/resources/video_summarizer(?=/|$)(.*)",
             r"/data/shared/Qwen/videos/video_summarizer\1",
             video_path,
         )
@@ -624,7 +624,7 @@ async def infer_batch_images_path(request: BatchImagesRequest):
             p = p.replace("/home/broliang", "/data/shared/Qwen")
             p = p.replace("~/", "/data/shared/Qwen/")
             p = re.sub(
-                r"^/data/video_summarizer(?=/|$)(.*)",
+                r"^/mnt/omv/resources/video_summarizer(?=/|$)(.*)",
                 r"/data/shared/Qwen/videos/video_summarizer\1",
                 p,
             )
@@ -687,7 +687,9 @@ async def infer_batch_images_path(request: BatchImagesRequest):
 
         # Batch inference
         write_log("Running batch generation for images...")
-        generated_ids = model.generate(**inputs, max_new_tokens=request.max_new_tokens)
+        generated_ids = model.generate(
+            **inputs, max_new_tokens=request.max_new_tokens, top_k=5
+        )
         generated_ids_trimmed = [
             out_ids[len(in_ids) :]
             for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
