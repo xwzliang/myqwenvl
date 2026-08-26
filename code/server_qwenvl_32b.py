@@ -2,6 +2,7 @@ import torch
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from fastapi import FastAPI, HTTPException
 from fastapi import UploadFile, File, Form
+import json
 import shutil
 import os
 import uuid
@@ -99,6 +100,8 @@ def load_models():
     if processor is None:
         write_log("Loading processor...")
         processor = AutoProcessor.from_pretrained(MODEL_PATH)
+        processor.tokenizer.padding_side = "left"
+        write_log("Tokenizer padding side set to left")
         write_log("Processor loaded successfully")
 
 
@@ -695,6 +698,156 @@ async def infer_batch_images_path(request: BatchImagesRequest):
     except Exception as e:
         error_msg = (
             f"Error in batch image inference: {str(e)}\n{traceback.format_exc()}"
+        )
+        write_log(error_msg, "ERROR")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+class BatchVideoInput(BaseModel):
+    video_path: str
+    prompt: str
+    # Accepted for client compatibility; the rendered prompt already includes it.
+    transcript: Optional[str] = None
+
+
+class BatchVideosRequest(BaseModel):
+    videos: List[BatchVideoInput]
+    fps: float = 5.0
+    max_pixels: int = 360 * 420
+    max_new_tokens: int = 8192
+
+
+@app.post("/infer_batch_videos_path")
+async def infer_batch_videos_path(request: BatchVideosRequest):
+    try:
+        write_log(f"Received batch videos request: {len(request.videos)} videos")
+        write_log(f"Request parameters: {request.dict()}")
+
+        if model is None or processor is None:
+            load_models()
+
+        if not request.videos:
+            raise HTTPException(status_code=400, detail="videos cannot be empty.")
+
+        def strip_file_uri(path: str) -> str:
+            return path[7:] if path.startswith("file://") else path
+
+        def normalize_path(path: str) -> str:
+            path = strip_file_uri(path)
+            path = path.replace("/home/broliang", "/data/shared/Qwen")
+            path = path.replace("~/", "/data/shared/Qwen/")
+            return re.sub(
+                r"^/mnt/omv/resources/video_summarizer(?=/|$)(.*)",
+                r"/data/shared/Qwen/videos/video_summarizer\1",
+                path,
+            )
+
+        normalized_videos = []
+        for video in request.videos:
+            video_path = normalize_path(video.video_path)
+            if not os.path.exists(video_path):
+                message = f"Video not found: {video_path}"
+                write_log(message, "ERROR")
+                raise HTTPException(status_code=400, detail=message)
+            if not video.prompt.strip():
+                message = f"Prompt cannot be empty for video: {video_path}"
+                write_log(message, "ERROR")
+                raise HTTPException(status_code=400, detail=message)
+            normalized_videos.append((video_path, video.prompt))
+
+        conversations = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video", "video": video_path},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+            for video_path, prompt in normalized_videos
+        ]
+
+        write_log(f"Prepared {len(conversations)} conversations for batch inference")
+
+        inputs = processor.apply_chat_template(
+            conversations,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            padding=True,
+            return_tensors="pt",
+            fps=request.fps,
+            max_pixels=request.max_pixels,
+        )
+        inputs = inputs.to(model.device)
+
+        write_log("Running batch generation for videos...")
+        generated_ids = model.generate(
+            **inputs, max_new_tokens=request.max_new_tokens
+        )
+        generated_ids_trimmed = [
+            out_ids[len(in_ids) :]
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        output_texts = processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+        results = []
+        valid_caption_count = 0
+        for (video_path, prompt), caption in zip(normalized_videos, output_texts):
+            caption_length = len(caption)
+            write_log(
+                f"Raw batch caption: video={video_path}, "
+                f"length={caption_length}, raw={caption!r}"
+            )
+
+            validation_error = None
+            if not caption.strip():
+                validation_error = "empty output"
+            else:
+                try:
+                    payload = json.loads(caption)
+                except json.JSONDecodeError as exc:
+                    validation_error = f"invalid JSON: {exc}"
+                else:
+                    if not isinstance(payload, dict):
+                        validation_error = "JSON root is not an object"
+                    elif not str(payload.get("description") or "").strip():
+                        validation_error = "missing nonempty description"
+
+            if validation_error:
+                write_log(
+                    f"Invalid batch caption: video={video_path}, "
+                    f"length={caption_length}, reason={validation_error}",
+                    "WARNING",
+                )
+            else:
+                valid_caption_count += 1
+                write_log(
+                    f"Valid batch caption: video={video_path}, "
+                    f"length={caption_length}"
+                )
+
+            results.append(
+                {"video": video_path, "prompt": prompt, "caption": caption}
+            )
+
+        write_log(
+            f"Batch decoded {len(results)} video captions: "
+            f"valid={valid_caption_count}, "
+            f"invalid={len(results) - valid_caption_count}"
+        )
+        return {"caption": results}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = (
+            f"Error in batch video inference: {str(e)}\n{traceback.format_exc()}"
         )
         write_log(error_msg, "ERROR")
         raise HTTPException(status_code=500, detail=error_msg)
