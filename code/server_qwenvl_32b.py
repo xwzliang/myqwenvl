@@ -1,6 +1,5 @@
 import torch
-from modelscope import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, AutoProcessor
-from qwen_vl_utils import process_vision_info
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from fastapi import FastAPI, HTTPException
 from fastapi import UploadFile, File, Form
 import shutil
@@ -81,8 +80,9 @@ app = FastAPI()
 # Global variables for model and processor
 model = None
 processor = None
-# MODEL_PATH = "./models/Qwen2.5-VL-32B-Instruct"
-MODEL_PATH = "./models/Qwen2.5-VL-7B-Instruct"
+MODEL_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "Qwen3-VL-8B-Instruct")
+)
 
 
 def load_models():
@@ -90,13 +90,10 @@ def load_models():
     global model, processor
     if model is None:
         write_log("Loading model...")
-        # We recommend enabling flash_attention_2 for better acceleration and memory saving
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
             MODEL_PATH,
-            torch_dtype=torch.float16,
-            attn_implementation="flash_attention_2",
+            dtype="auto",
             device_map="auto",
-            load_in_4bit=True,
         )
         write_log("Model loaded successfully")
     if processor is None:
@@ -197,13 +194,13 @@ async def get_model_info():
             return {
                 "status": "Model not loaded",
                 "model_path": MODEL_PATH,
-                "model_type": "Qwen2.5-VL-32B-Instruct",
+                "model_type": "Qwen3-VL-8B-Instruct",
             }
 
         return {
             "status": "Model loaded",
             "model_path": MODEL_PATH,
-            "model_type": "Qwen2.5-VL-32B-Instruct",
+            "model_type": "Qwen3-VL-8B-Instruct",
             "model_config": {
                 "dtype": str(model.dtype),
                 "device": str(next(model.parameters()).device),
@@ -341,22 +338,18 @@ async def generate_caption(request: CaptionRequest):
 
         write_log(f"Prepared messages for model: {messages}")
 
-        # Process the input
-        text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        image_inputs, video_inputs, video_kwargs = process_vision_info(
-            messages, return_video_kwargs=True
-        )
-        inputs = processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
+        # Process the multimodal conversation using the Qwen3-VL processor.
+        inputs = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
             padding=True,
             return_tensors="pt",
-            **video_kwargs,
+            fps=request.fps,
+            max_pixels=request.max_pixels,
         )
-        inputs = inputs.to("cuda", dtype=torch.float16)
+        inputs = inputs.to(model.device)
 
         # Generate caption
         write_log("Generating caption...")
@@ -446,21 +439,17 @@ async def infer(
 
         write_log(f"Prepared messages for model: {messages}")
 
-        text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        image_inputs, video_inputs, video_kwargs = process_vision_info(
-            messages, return_video_kwargs=True
-        )
-        inputs = processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
+        inputs = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
             padding=True,
             return_tensors="pt",
-            **video_kwargs,
+            fps=fps,
+            max_pixels=max_pixels,
         )
-        inputs = inputs.to("cuda", dtype=torch.float16)
+        inputs = inputs.to(model.device)
 
         write_log("Generating caption...")
         generated_ids = model.generate(**inputs, max_new_tokens=2048)
@@ -557,19 +546,16 @@ async def generate_caption_from_images(request: ImagesRequest):
 
         write_log(f"Prepared messages for model: {messages}")
 
-        # Prepare inputs
-        text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
+        # Prepare inputs using the Qwen3-VL multimodal chat template.
+        inputs = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
             padding=True,
             return_tensors="pt",
         )
-        inputs = inputs.to("cuda", dtype=torch.float16)
+        inputs = inputs.to(model.device)
 
         # Inference
         write_log("Generating caption for images...")
@@ -668,22 +654,16 @@ async def infer_batch_images_path(request: BatchImagesRequest):
 
         write_log(f"Prepared {len(conversations)} conversations for batch inference")
 
-        # Prepare batched inputs
-        texts = [
-            processor.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True
-            )
-            for msgs in conversations
-        ]
-        image_inputs, video_inputs = process_vision_info(conversations)
-        inputs = processor(
-            text=texts,
-            images=image_inputs,
-            videos=video_inputs,
+        # Prepare batched inputs using the Qwen3-VL multimodal chat template.
+        inputs = processor.apply_chat_template(
+            conversations,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
             padding=True,
             return_tensors="pt",
         )
-        inputs = inputs.to("cuda", dtype=torch.float16)
+        inputs = inputs.to(model.device)
 
         # Batch inference
         write_log("Running batch generation for images...")
