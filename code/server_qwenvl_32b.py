@@ -1,45 +1,66 @@
 import torch
+import av
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from fastapi import FastAPI, HTTPException
 from fastapi import UploadFile, File, Form
-import json
-import shutil
-import os
-import uuid
-from pydantic import BaseModel
-from typing import Optional, List, Union
-import uvicorn
 import gc
+import json
+import math
 import os
-import tempfile
 import re
-from moviepy import VideoFileClip
-import traceback
-import logging
-from datetime import datetime
 import shutil
+import tempfile
 import threading
+import time
+import traceback
+import uuid
+from datetime import datetime
+from pydantic import BaseModel
+from typing import Optional, List, Literal
+import uvicorn
+from moviepy import VideoFileClip
 
 # Create logs directory if it doesn't exist
 log_dir = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, "server.log")
+DEBUG_PAYLOAD_LOGGING = os.getenv("QWENVL_DEBUG_PAYLOADS", "").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+ATTENTION_BACKEND = os.getenv("QWENVL_ATTENTION_BACKEND", "flash_attention_2")
+if ATTENTION_BACKEND not in {"sdpa", "flash_attention_2"}:
+    raise ValueError(
+        "QWENVL_ATTENTION_BACKEND must be 'sdpa' or 'flash_attention_2'"
+    )
+
+_log_file_handle = None
+_log_lock = threading.Lock()
 
 
 def write_log(message, level="INFO"):
-    """Write log message directly to file and console."""
+    """Write a log message using one persistent, line-buffered file handle."""
+    global _log_file_handle
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_message = f"{timestamp} - {level} - {message}\n"
 
-        # Write to console
-        print(log_message, end="")
-
-        # Write to log file
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(log_message)
+        with _log_lock:
+            print(log_message, end="")
+            if _log_file_handle is None:
+                _log_file_handle = open(
+                    log_file, "a", encoding="utf-8", buffering=1
+                )
+            _log_file_handle.write(log_message)
     except Exception as e:
         print(f"Error writing to log: {str(e)}")
+
+
+def write_debug_log(message):
+    """Write payload-heavy diagnostics only when explicitly enabled."""
+    if DEBUG_PAYLOAD_LOGGING:
+        write_log(message, "DEBUG")
 
 
 def rotate_log_file(log_file, max_size_mb=10):
@@ -93,10 +114,14 @@ def load_models():
         write_log("Loading model...")
         model = Qwen3VLForConditionalGeneration.from_pretrained(
             MODEL_PATH,
-            dtype="auto",
-            device_map="auto",
+            dtype=torch.bfloat16,
+            attn_implementation=ATTENTION_BACKEND,
+            device_map={"": 0},
+        ).eval()
+        write_log(
+            f"Model loaded successfully with attention={ATTENTION_BACKEND}, "
+            f"dtype={model.dtype}"
         )
-        write_log("Model loaded successfully")
     if processor is None:
         write_log("Loading processor...")
         processor = AutoProcessor.from_pretrained(MODEL_PATH)
@@ -214,9 +239,18 @@ async def get_model_info():
                 ),
                 "flash_attention": (
                     "Enabled"
-                    if hasattr(model, "config")
-                    and getattr(model.config, "use_flash_attention_2", False)
+                    if getattr(
+                        getattr(model, "config", None),
+                        "_attn_implementation",
+                        ATTENTION_BACKEND,
+                    )
+                    == "flash_attention_2"
                     else "Disabled"
+                ),
+                "attention_backend": getattr(
+                    getattr(model, "config", None),
+                    "_attn_implementation",
+                    ATTENTION_BACKEND,
                 ),
             },
         }
@@ -292,7 +326,7 @@ async def generate_caption(request: CaptionRequest):
     temp_video_path = None
     try:
         write_log(f"Received caption request for video: {request.video_path}")
-        write_log(f"Request parameters: {request.dict()}")
+        write_debug_log(f"Request parameters: {request.dict()}")
 
         if model is None or processor is None:
             load_models()
@@ -339,7 +373,7 @@ async def generate_caption(request: CaptionRequest):
                 "text"
             ] = f"Given the transcript: '{request.transcript}', {request.query}"
 
-        write_log(f"Prepared messages for model: {messages}")
+        write_debug_log(f"Prepared messages for model: {messages}")
 
         # Process the multimodal conversation using the Qwen3-VL processor.
         inputs = processor.apply_chat_template(
@@ -347,10 +381,12 @@ async def generate_caption(request: CaptionRequest):
             tokenize=True,
             add_generation_prompt=True,
             return_dict=True,
-            padding=True,
             return_tensors="pt",
-            fps=request.fps,
-            max_pixels=request.max_pixels,
+            processor_kwargs={
+                "padding": True,
+                "fps": request.fps,
+                "max_pixels": request.max_pixels,
+            },
         )
         inputs = inputs.to(model.device)
 
@@ -440,17 +476,19 @@ async def infer(
                 "text"
             ] = f"Given the transcript: '{transcript}', {query}"
 
-        write_log(f"Prepared messages for model: {messages}")
+        write_debug_log(f"Prepared messages for model: {messages}")
 
         inputs = processor.apply_chat_template(
             messages,
             tokenize=True,
             add_generation_prompt=True,
             return_dict=True,
-            padding=True,
             return_tensors="pt",
-            fps=fps,
-            max_pixels=max_pixels,
+            processor_kwargs={
+                "padding": True,
+                "fps": fps,
+                "max_pixels": max_pixels,
+            },
         )
         inputs = inputs.to(model.device)
 
@@ -493,7 +531,7 @@ class ImagesRequest(BaseModel):
 async def generate_caption_from_images(request: ImagesRequest):
     try:
         write_log(f"Received images request: {len(request.image_paths)} images")
-        write_log(f"Request parameters: {request.dict()}")
+        write_debug_log(f"Request parameters: {request.dict()}")
 
         if model is None or processor is None:
             load_models()
@@ -547,7 +585,7 @@ async def generate_caption_from_images(request: ImagesRequest):
             }
         ]
 
-        write_log(f"Prepared messages for model: {messages}")
+        write_debug_log(f"Prepared messages for model: {messages}")
 
         # Prepare inputs using the Qwen3-VL multimodal chat template.
         inputs = processor.apply_chat_template(
@@ -555,8 +593,8 @@ async def generate_caption_from_images(request: ImagesRequest):
             tokenize=True,
             add_generation_prompt=True,
             return_dict=True,
-            padding=True,
             return_tensors="pt",
+            processor_kwargs={"padding": True},
         )
         inputs = inputs.to(model.device)
 
@@ -597,7 +635,7 @@ class BatchImagesRequest(BaseModel):
 async def infer_batch_images_path(request: BatchImagesRequest):
     try:
         write_log(f"Received batch images request: {len(request.image_paths)} images")
-        write_log(f"Request parameters: {request.dict()}")
+        write_debug_log(f"Request parameters: {request.dict()}")
 
         if model is None or processor is None:
             load_models()
@@ -663,8 +701,8 @@ async def infer_batch_images_path(request: BatchImagesRequest):
             tokenize=True,
             add_generation_prompt=True,
             return_dict=True,
-            padding=True,
             return_tensors="pt",
+            processor_kwargs={"padding": True},
         )
         inputs = inputs.to(model.device)
 
@@ -715,19 +753,131 @@ class BatchVideosRequest(BaseModel):
     fps: float = 5.0
     max_pixels: int = 360 * 420
     max_new_tokens: int = 8192
+    batch_strategy: Literal["linear", "static", "bucketed", "hybrid"] = "hybrid"
+    max_batch_size: int = 4
+    padding_ratio_threshold: float = 1.25
+
+
+def estimate_video_batch_item(index, video_path, prompt, fps, max_pixels):
+    """Estimate relative multimodal token cost for batch scheduling."""
+    duration = 0.0
+    container = None
+    try:
+        container = av.open(video_path)
+        if container.duration is not None:
+            duration = float(container.duration / av.time_base)
+        elif container.streams.video:
+            video_stream = container.streams.video[0]
+            if video_stream.duration is not None:
+                duration = float(video_stream.duration * video_stream.time_base)
+    except Exception as exc:
+        write_log(
+            f"Could not read video duration for {video_path}: {exc}; "
+            "using a one-frame scheduling estimate",
+            "WARNING",
+        )
+    finally:
+        if container is not None:
+            container.close()
+
+    estimated_frames = max(1, math.ceil(duration * fps))
+    video_processor = getattr(processor, "video_processor", None)
+    max_frames = getattr(video_processor, "max_frames", None)
+    if isinstance(max_frames, int) and max_frames > 0:
+        estimated_frames = min(estimated_frames, max_frames)
+
+    patch_size = int(getattr(video_processor, "patch_size", 16))
+    merge_size = int(getattr(video_processor, "merge_size", 2))
+    temporal_patch_size = int(
+        getattr(video_processor, "temporal_patch_size", 2)
+    )
+    pixels_per_visual_token = (
+        patch_size * patch_size * merge_size * merge_size * temporal_patch_size
+    )
+    visual_tokens_per_frame = max(
+        1, math.ceil(max_pixels / pixels_per_visual_token)
+    )
+    prompt_tokens = len(
+        processor.tokenizer.encode(prompt, add_special_tokens=False)
+    )
+    estimated_cost = estimated_frames * visual_tokens_per_frame + prompt_tokens
+
+    return {
+        "index": index,
+        "video_path": video_path,
+        "prompt": prompt,
+        "duration": duration,
+        "estimated_frames": estimated_frames,
+        "visual_tokens_per_frame": visual_tokens_per_frame,
+        "prompt_tokens": prompt_tokens,
+        "estimated_cost": estimated_cost,
+    }
+
+
+def batch_padding_ratio(items):
+    """Return padded cost divided by useful cost for a proposed batch."""
+    if not items:
+        return 1.0
+    costs = [max(1, item["estimated_cost"]) for item in items]
+    return len(costs) * max(costs) / sum(costs)
+
+
+def schedule_video_batches(items, strategy, max_batch_size, padding_threshold):
+    """Create linear, static, bucketed, or padding-aware hybrid batches."""
+    if strategy == "linear":
+        return [[item] for item in items]
+
+    scheduled_items = list(items)
+    if strategy in {"bucketed", "hybrid"}:
+        scheduled_items.sort(key=lambda item: item["estimated_cost"])
+
+    batches = [
+        scheduled_items[start : start + max_batch_size]
+        for start in range(0, len(scheduled_items), max_batch_size)
+    ]
+    if strategy != "hybrid":
+        return batches
+
+    def split_if_needed(batch):
+        if len(batch) <= 1 or batch_padding_ratio(batch) <= padding_threshold:
+            return [batch]
+        midpoint = len(batch) // 2
+        return split_if_needed(batch[:midpoint]) + split_if_needed(batch[midpoint:])
+
+    hybrid_batches = []
+    for batch in batches:
+        hybrid_batches.extend(split_if_needed(batch))
+    return hybrid_batches
 
 
 @app.post("/infer_batch_videos_path")
 async def infer_batch_videos_path(request: BatchVideosRequest):
     try:
-        write_log(f"Received batch videos request: {len(request.videos)} videos")
-        write_log(f"Request parameters: {request.dict()}")
+        write_log(
+            f"Received batch videos request: videos={len(request.videos)}, "
+            f"strategy={request.batch_strategy}, "
+            f"max_batch_size={request.max_batch_size}, fps={request.fps}, "
+            f"max_pixels={request.max_pixels}, "
+            f"max_new_tokens={request.max_new_tokens}"
+        )
+        write_debug_log(f"Request parameters: {request.dict()}")
 
         if model is None or processor is None:
             load_models()
 
         if not request.videos:
             raise HTTPException(status_code=400, detail="videos cannot be empty.")
+        if request.max_batch_size < 1:
+            raise HTTPException(
+                status_code=400, detail="max_batch_size must be at least 1."
+            )
+        if request.padding_ratio_threshold < 1.0:
+            raise HTTPException(
+                status_code=400,
+                detail="padding_ratio_threshold must be at least 1.0.",
+            )
+        if request.fps <= 0:
+            raise HTTPException(status_code=400, detail="fps must be greater than 0.")
 
         def strip_file_uri(path: str) -> str:
             return path[7:] if path.startswith("file://") else path
@@ -742,8 +892,8 @@ async def infer_batch_videos_path(request: BatchVideosRequest):
                 path,
             )
 
-        normalized_videos = []
-        for video in request.videos:
+        scheduled_items = []
+        for index, video in enumerate(request.videos):
             video_path = normalize_path(video.video_path)
             if not os.path.exists(video_path):
                 message = f"Video not found: {video_path}"
@@ -753,93 +903,178 @@ async def infer_batch_videos_path(request: BatchVideosRequest):
                 message = f"Prompt cannot be empty for video: {video_path}"
                 write_log(message, "ERROR")
                 raise HTTPException(status_code=400, detail=message)
-            normalized_videos.append((video_path, video.prompt))
+            scheduled_items.append(
+                estimate_video_batch_item(
+                    index,
+                    video_path,
+                    video.prompt,
+                    request.fps,
+                    request.max_pixels,
+                )
+            )
 
-        conversations = [
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "video", "video": video_path},
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ]
-            for video_path, prompt in normalized_videos
-        ]
-
-        write_log(f"Prepared {len(conversations)} conversations for batch inference")
-
-        inputs = processor.apply_chat_template(
-            conversations,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            padding=True,
-            return_tensors="pt",
-            fps=request.fps,
-            max_pixels=request.max_pixels,
+        batches = schedule_video_batches(
+            scheduled_items,
+            request.batch_strategy,
+            request.max_batch_size,
+            request.padding_ratio_threshold,
         )
-        inputs = inputs.to(model.device)
-
-        write_log("Running batch generation for videos...")
-        generated_ids = model.generate(
-            **inputs, max_new_tokens=request.max_new_tokens
-        )
-        generated_ids_trimmed = [
-            out_ids[len(in_ids) :]
-            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        output_texts = processor.batch_decode(
-            generated_ids_trimmed,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
+        write_log(
+            f"Scheduled {len(scheduled_items)} videos into {len(batches)} batches: "
+            + ", ".join(
+                f"size={len(batch)}/padding={batch_padding_ratio(batch):.3f}"
+                for batch in batches
+            )
         )
 
-        results = []
+        results = [None] * len(scheduled_items)
         valid_caption_count = 0
-        for (video_path, prompt), caption in zip(normalized_videos, output_texts):
-            caption_length = len(caption)
+        total_preprocessing_seconds = 0.0
+        total_generation_seconds = 0.0
+
+        for batch_number, batch in enumerate(batches, start=1):
+            conversations = [
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "video", "video": item["video_path"]},
+                            {"type": "text", "text": item["prompt"]},
+                        ],
+                    }
+                ]
+                for item in batch
+            ]
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+            preprocessing_started = time.perf_counter()
+            inputs = processor.apply_chat_template(
+                conversations,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+                processor_kwargs={
+                    "padding": True,
+                    "fps": request.fps,
+                    "max_pixels": request.max_pixels,
+                },
+            )
+            inputs = inputs.to(model.device)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            preprocessing_seconds = time.perf_counter() - preprocessing_started
+            total_preprocessing_seconds += preprocessing_seconds
+
+            attention_tokens = inputs.attention_mask.sum(dim=1).tolist()
+            padded_input_shape = tuple(inputs.input_ids.shape)
+            video_grid_t = (
+                inputs.video_grid_thw[:, 0].tolist()
+                if "video_grid_thw" in inputs
+                else [None] * len(batch)
+            )
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+            generation_started = time.perf_counter()
+            generated_ids = model.generate(
+                **inputs, max_new_tokens=request.max_new_tokens
+            )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            generation_seconds = time.perf_counter() - generation_started
+            total_generation_seconds += generation_seconds
+            peak_cuda_gb = (
+                torch.cuda.max_memory_allocated() / 1024**3
+                if torch.cuda.is_available()
+                else 0.0
+            )
+
+            generated_ids_trimmed = [
+                out_ids[len(in_ids) :]
+                for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            pad_token_id = processor.tokenizer.pad_token_id
+            generated_token_counts = [
+                int((out_ids != pad_token_id).sum().item())
+                if pad_token_id is not None
+                else int(out_ids.numel())
+                for out_ids in generated_ids_trimmed
+            ]
+            output_texts = processor.batch_decode(
+                generated_ids_trimmed,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+
             write_log(
-                f"Raw batch caption: video={video_path}, "
-                f"length={caption_length}, raw={caption!r}"
+                f"Batch {batch_number}/{len(batches)} metrics: size={len(batch)}, "
+                f"padding_ratio={batch_padding_ratio(batch):.3f}, "
+                f"preprocessing_seconds={preprocessing_seconds:.3f}, "
+                f"generation_seconds={generation_seconds:.3f}, "
+                f"padded_input_shape={padded_input_shape}, "
+                f"attention_tokens={attention_tokens}, "
+                f"generated_tokens={generated_token_counts}, "
+                f"peak_cuda_gb={peak_cuda_gb:.3f}"
             )
 
-            validation_error = None
-            if not caption.strip():
-                validation_error = "empty output"
-            else:
-                try:
-                    payload = json.loads(caption)
-                except json.JSONDecodeError as exc:
-                    validation_error = f"invalid JSON: {exc}"
+            for position, item in enumerate(batch):
+                caption = output_texts[position] if position < len(output_texts) else ""
+                caption_length = len(caption)
+                write_log(
+                    f"Batch item metrics: video={item['video_path']}, "
+                    f"duration={item['duration']:.3f}, "
+                    f"estimated_frames={item['estimated_frames']}, "
+                    f"video_grid_t={video_grid_t[position]}, "
+                    f"prompt_tokens={item['prompt_tokens']}, "
+                    f"estimated_cost={item['estimated_cost']}, "
+                    f"attention_tokens={attention_tokens[position]}, "
+                    f"generated_tokens={generated_token_counts[position]}, "
+                    f"caption_length={caption_length}"
+                )
+                write_debug_log(
+                    f"Raw batch caption: video={item['video_path']}, "
+                    f"length={caption_length}, raw={caption!r}"
+                )
+
+                validation_error = None
+                if not caption.strip():
+                    validation_error = "empty output"
                 else:
-                    if not isinstance(payload, dict):
-                        validation_error = "JSON root is not an object"
-                    elif not str(payload.get("description") or "").strip():
-                        validation_error = "missing nonempty description"
+                    try:
+                        payload = json.loads(caption)
+                    except json.JSONDecodeError as exc:
+                        validation_error = f"invalid JSON: {exc}"
+                    else:
+                        if not isinstance(payload, dict):
+                            validation_error = "JSON root is not an object"
+                        elif not str(payload.get("description") or "").strip():
+                            validation_error = "missing nonempty description"
 
-            if validation_error:
-                write_log(
-                    f"Invalid batch caption: video={video_path}, "
-                    f"length={caption_length}, reason={validation_error}",
-                    "WARNING",
-                )
-            else:
-                valid_caption_count += 1
-                write_log(
-                    f"Valid batch caption: video={video_path}, "
-                    f"length={caption_length}"
-                )
+                if validation_error:
+                    write_log(
+                        f"Invalid batch caption: video={item['video_path']}, "
+                        f"length={caption_length}, reason={validation_error}",
+                        "WARNING",
+                    )
+                else:
+                    valid_caption_count += 1
 
-            results.append(
-                {"video": video_path, "prompt": prompt, "caption": caption}
-            )
+                results[item["index"]] = {
+                    "video": item["video_path"],
+                    "prompt": item["prompt"],
+                    "caption": caption,
+                }
 
         write_log(
-            f"Batch decoded {len(results)} video captions: "
+            f"Batch request complete: decoded={len(results)}, "
             f"valid={valid_caption_count}, "
-            f"invalid={len(results) - valid_caption_count}"
+            f"invalid={len(results) - valid_caption_count}, "
+            f"preprocessing_seconds={total_preprocessing_seconds:.3f}, "
+            f"generation_seconds={total_generation_seconds:.3f}"
         )
         return {"caption": results}
 
