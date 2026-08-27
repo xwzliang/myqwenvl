@@ -761,6 +761,7 @@ class BatchVideosRequest(BaseModel):
 def estimate_video_batch_item(index, video_path, prompt, fps, max_pixels):
     """Estimate relative multimodal token cost for batch scheduling."""
     duration = 0.0
+    source_frames = 0
     container = None
     try:
         container = av.open(video_path)
@@ -770,6 +771,13 @@ def estimate_video_batch_item(index, video_path, prompt, fps, max_pixels):
             video_stream = container.streams.video[0]
             if video_stream.duration is not None:
                 duration = float(video_stream.duration * video_stream.time_base)
+        if container.streams.video:
+            video_stream = container.streams.video[0]
+            source_frames = int(video_stream.frames or 0)
+            if source_frames <= 0 and video_stream.average_rate and duration > 0:
+                source_frames = max(
+                    1, round(duration * float(video_stream.average_rate))
+                )
     except Exception as exc:
         write_log(
             f"Could not read video duration for {video_path}: {exc}; "
@@ -791,6 +799,10 @@ def estimate_video_batch_item(index, video_path, prompt, fps, max_pixels):
     temporal_patch_size = int(
         getattr(video_processor, "temporal_patch_size", 2)
     )
+    minimum_frames = int(getattr(video_processor, "min_frames", 4))
+    requires_minimum_frames = 0 < source_frames < temporal_patch_size
+    if requires_minimum_frames:
+        estimated_frames = max(minimum_frames, temporal_patch_size)
     pixels_per_visual_token = (
         patch_size * patch_size * merge_size * merge_size * temporal_patch_size
     )
@@ -807,7 +819,10 @@ def estimate_video_batch_item(index, video_path, prompt, fps, max_pixels):
         "video_path": video_path,
         "prompt": prompt,
         "duration": duration,
+        "source_frames": source_frames,
         "estimated_frames": estimated_frames,
+        "minimum_frames": minimum_frames,
+        "requires_minimum_frames": requires_minimum_frames,
         "visual_tokens_per_frame": visual_tokens_per_frame,
         "prompt_tokens": prompt_tokens,
         "estimated_cost": estimated_cost,
@@ -827,7 +842,12 @@ def schedule_video_batches(items, strategy, max_batch_size, padding_threshold):
     if strategy == "linear":
         return [[item] for item in items]
 
-    scheduled_items = list(items)
+    minimum_frame_items = [
+        item for item in items if item.get("requires_minimum_frames")
+    ]
+    scheduled_items = [
+        item for item in items if not item.get("requires_minimum_frames")
+    ]
     if strategy in {"bucketed", "hybrid"}:
         scheduled_items.sort(key=lambda item: item["estimated_cost"])
 
@@ -836,7 +856,7 @@ def schedule_video_batches(items, strategy, max_batch_size, padding_threshold):
         for start in range(0, len(scheduled_items), max_batch_size)
     ]
     if strategy != "hybrid":
-        return batches
+        return batches + [[item] for item in minimum_frame_items]
 
     def split_if_needed(batch):
         if len(batch) <= 1 or batch_padding_ratio(batch) <= padding_threshold:
@@ -847,7 +867,7 @@ def schedule_video_batches(items, strategy, max_batch_size, padding_threshold):
     hybrid_batches = []
     for batch in batches:
         hybrid_batches.extend(split_if_needed(batch))
-    return hybrid_batches
+    return hybrid_batches + [[item] for item in minimum_frame_items]
 
 
 @app.post("/infer_batch_videos_path")
@@ -950,17 +970,27 @@ async def infer_batch_videos_path(request: BatchVideosRequest):
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
             preprocessing_started = time.perf_counter()
+            video_processor_kwargs = {
+                "padding": True,
+                "max_pixels": request.max_pixels,
+            }
+            if len(batch) == 1 and batch[0]["requires_minimum_frames"]:
+                video_processor_kwargs["num_frames"] = batch[0]["minimum_frames"]
+                video_processor_kwargs["fps"] = None
+                sampling_description = (
+                    f"num_frames={batch[0]['minimum_frames']} (minimum-frame fallback)"
+                )
+            else:
+                video_processor_kwargs["fps"] = request.fps
+                sampling_description = f"fps={request.fps}"
+
             inputs = processor.apply_chat_template(
                 conversations,
                 tokenize=True,
                 add_generation_prompt=True,
                 return_dict=True,
                 return_tensors="pt",
-                processor_kwargs={
-                    "padding": True,
-                    "fps": request.fps,
-                    "max_pixels": request.max_pixels,
-                },
+                processor_kwargs=video_processor_kwargs,
             )
             inputs = inputs.to(model.device)
             if torch.cuda.is_available():
@@ -1013,6 +1043,7 @@ async def infer_batch_videos_path(request: BatchVideosRequest):
             write_log(
                 f"Batch {batch_number}/{len(batches)} metrics: size={len(batch)}, "
                 f"padding_ratio={batch_padding_ratio(batch):.3f}, "
+                f"sampling={sampling_description}, "
                 f"preprocessing_seconds={preprocessing_seconds:.3f}, "
                 f"generation_seconds={generation_seconds:.3f}, "
                 f"padded_input_shape={padded_input_shape}, "
@@ -1027,6 +1058,7 @@ async def infer_batch_videos_path(request: BatchVideosRequest):
                 write_log(
                     f"Batch item metrics: video={item['video_path']}, "
                     f"duration={item['duration']:.3f}, "
+                    f"source_frames={item['source_frames']}, "
                     f"estimated_frames={item['estimated_frames']}, "
                     f"video_grid_t={video_grid_t[position]}, "
                     f"prompt_tokens={item['prompt_tokens']}, "
